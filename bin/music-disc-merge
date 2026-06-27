@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+"""
+music-disc-merge — find multi-disc albums split across sibling folders
+(e.g. "Time Disc 1", "Time Disc 2") and merge them into one album folder.
+
+DRY-RUN BY DEFAULT. It prints exactly what it would do and changes nothing
+until you pass --apply.
+
+What it targets:
+  Sibling folders under the same artist whose names differ only by a disc
+  marker:  "Album Disc 1" / "Album Disc 2",  "Album [Disc 1]",  "Album CD2".
+  These get merged into a single "Album" folder.
+
+What it leaves alone:
+  Albums already kept in ONE folder with disc-prefixed filenames
+  (e.g. "1-01 Track.mp3", "2-01 Track.mp3"). Those are already combined.
+
+Collision safety:
+  If two discs contain the same track filename (both "01 ..."), files are
+  renamed with a "d{N}-" prefix on merge so disc order is preserved and
+  nothing is overwritten. Use --no-prefix to disable (will refuse to
+  overwrite on a real collision).
+"""
+
+import argparse
+import os
+import re
+import shutil
+import sys
+import unicodedata
+from collections import defaultdict
+from pathlib import Path
+
+AUDIO_EXTS = {
+    ".mp3", ".m4a", ".m4b", ".flac", ".aac", ".ogg",
+    ".opus", ".wav", ".wma", ".alac", ".aiff", ".aif",
+}
+
+DEFAULT_DEST = Path("/Volumes/MUSIC")
+
+# Matches a trailing disc marker:  " Disc 1", " [Disc 2]", " (CD 3)", " CD2"
+DISC_RE = re.compile(
+    r"^(?P<base>.+?)[\s_]*[\[\(]?\s*(?:dis[ck]|cd)\s*(?P<num>\d+)\s*[\]\)]?$",
+    re.IGNORECASE,
+)
+
+
+def is_audio(p: Path) -> bool:
+    return p.suffix.lower() in AUDIO_EXTS
+
+
+def norm(s: str) -> str:
+    s = unicodedata.normalize("NFC", s)
+    return " ".join(s.casefold().split()).rstrip(". ")
+
+
+def find_groups(root: Path):
+    """Return list of (artist_dir, base_name, [(disc_num, folder), ...])
+    for each multi-disc group of sibling folders."""
+    def subdirs(d):
+        try:
+            return sorted(p for p in d.iterdir()
+                          if p.is_dir() and not p.name.startswith("."))
+        except PermissionError:
+            return []
+
+    groups = defaultdict(list)  # (artist_dir, norm_base) -> list[(num, folder, base)]
+    for artist_dir in subdirs(root):
+        for sub in subdirs(artist_dir):
+            m = DISC_RE.match(sub.name)
+            if not m:
+                continue
+            base = m.group("base").rstrip(" _-")
+            num = int(m.group("num"))
+            key = (artist_dir, norm(base))
+            groups[key].append((num, sub, base))
+    out = []
+    for (artist_dir, _nb), discs in groups.items():
+        discs.sort(key=lambda t: t[0])
+        base = discs[0][2]
+        out.append((artist_dir, base, discs))
+    return sorted(out, key=lambda t: (str(t[0]), t[1]))
+
+
+def audio_files(folder: Path):
+    return sorted(f for f in folder.iterdir() if f.is_file() and is_audio(f))
+
+
+def plan_merge(artist_dir, base, discs, prefix_mode):
+    """Return (target_dir, [(src_file, dest_name)], had_collision).
+
+    prefix_mode: 'auto'  -> add d{N}- prefix only to files whose bare name
+                            would collide with one already placed (clean names
+                            when the filenames already encode the disc);
+                 'all'   -> always prefix;
+                 'never' -> never prefix (a real collision is reported, file skipped)."""
+    target = artist_dir / base
+    used = set()                 # final dest names already taken
+    bare_seen = set()            # bare filenames seen so far
+    moves = []
+    had_collision = False
+    for num, folder, _b in discs:
+        for f in audio_files(folder):
+            name = f.name
+            collides = name in bare_seen
+            bare_seen.add(name)
+            if collides:
+                had_collision = True
+            if prefix_mode == "all" or (prefix_mode == "auto" and collides):
+                dest_name = f"d{num}-{name}"
+            else:
+                dest_name = name
+            if dest_name in used:           # never overwrite
+                continue
+            used.add(dest_name)
+            moves.append((f, dest_name))
+    return target, moves, had_collision
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Merge multi-disc album folders into one folder (dry-run by default).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    ap.add_argument("root", nargs="?", type=Path, default=DEFAULT_DEST,
+                    help=f"library root to reorganize (default: {DEFAULT_DEST})")
+    ap.add_argument("--apply", action="store_true",
+                    help="actually move files (default is dry-run preview)")
+    ap.add_argument("--prefix", choices=("auto", "all", "never"), default="auto",
+                    help="disc-number filename prefix: auto=only on collision "
+                         "(default), all=always, never")
+    ap.add_argument("--include-orphans", action="store_true",
+                    help="also merge groups with only ONE disc folder "
+                         "(likely incomplete rips); skipped by default")
+    args = ap.parse_args()
+
+    if not args.root.is_dir():
+        sys.exit(f"error: not a directory: {args.root}")
+
+    mode = "APPLY" if args.apply else "DRY-RUN (no changes)"
+    print(f"Root: {args.root}")
+    print(f"Mode: {mode}    Prefix: {args.prefix}    "
+          f"Orphans: {'included' if args.include_orphans else 'skipped'}\n")
+
+    groups = find_groups(args.root)
+    if not groups:
+        print("No multi-disc folder groups found.")
+        return
+
+    applied = 0
+    skipped_orphans = 0
+    for artist_dir, base, discs in groups:
+        rel = artist_dir.relative_to(args.root)
+        is_orphan = len(discs) == 1
+        if is_orphan and not args.include_orphans:
+            skipped_orphans += 1
+            continue
+        target, moves, collision = plan_merge(artist_dir, base, discs, args.prefix)
+        disc_list = ", ".join(f'"{f.name}" (#{n}, {len(audio_files(f))} trk)'
+                              for n, f, _b in discs)
+        print(f"{rel}/  ->  merge into \"{base}\"")
+        print(f"    discs: {disc_list}")
+        if is_orphan:
+            print("    note: only one disc folder found (incomplete? check for "
+                  "missing discs)")
+        if collision and args.prefix == "never":
+            print("    !! filename collision across discs — colliding files will "
+                  "be SKIPPED (use --prefix auto)")
+        elif collision:
+            print("    (collision found — those files get d#- prefixes)")
+        print(f"    {len(moves)} files -> {target}")
+
+        if args.apply:
+            target.mkdir(parents=True, exist_ok=True)
+            for src, dest_name in moves:
+                dest = target / dest_name
+                if dest.exists():
+                    print(f"    SKIP exists: {dest.name}")
+                    continue
+                shutil.move(str(src), str(dest))
+            # Remove now-empty (or junk-only) disc folders that aren't the target.
+            for _n, folder, _b in discs:
+                if folder == target:
+                    continue
+                leftover = [f for f in folder.iterdir() if is_audio(f)]
+                if not leftover:
+                    shutil.rmtree(folder, ignore_errors=True)
+            applied += 1
+        print()
+
+    if skipped_orphans:
+        print(f"({skipped_orphans} single-disc group(s) skipped — "
+              f"pass --include-orphans to merge those too.)")
+
+    if args.apply:
+        print(f"Done. Merged {applied} album(s).")
+        if str(args.root).startswith("/Volumes/"):
+            os.system(f'dot_clean -m "{args.root}" >/dev/null 2>&1')
+            print("Ran dot_clean to remove stray ._ files from the card.")
+    else:
+        mergeable = sum(1 for _a, _b, d in groups
+                        if len(d) > 1 or args.include_orphans)
+        print(f"{mergeable} group(s) would be merged. "
+              f"Re-run with --apply to do it.")
+
+
+if __name__ == "__main__":
+    main()

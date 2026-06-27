@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+"""
+music-sync-check — compare a source music library against the SD card and
+report what's new or incomplete, WITHOUT copying anything.
+
+Why album-folder granularity instead of file-by-file?
+  The Apple Music library and the iPod rips on the SD card name the same
+  track differently (e.g. "1-04 Voices.mp3" vs
+  "Alice in Chains - Facelift - 04. ... .mp3"). Comparing filenames would
+  flag everything as new. So we compare Artist/Album *folders* and, for
+  albums on both sides, compare track COUNTS to catch partial copies.
+
+Default source: the Apple Music media folder.
+Default dest:   /Volumes/MUSIC (the SD card).
+
+This tool is READ-ONLY. It prints a report and an rsync command you can
+run yourself if you want to copy the new albums over.
+"""
+
+import argparse
+import os
+import sys
+import unicodedata
+from pathlib import Path
+
+AUDIO_EXTS = {
+    ".mp3", ".m4a", ".m4b", ".flac", ".aac", ".ogg",
+    ".opus", ".wav", ".wma", ".alac", ".aiff", ".aif",
+}
+
+HOME = Path.home()
+DEFAULT_SOURCE = HOME / "Music/Music/Media.localized/Music"
+DEFAULT_DEST = Path("/Volumes/MUSIC")
+
+# Typographic characters that differ between the two libraries but mean the
+# same thing — folded to ASCII for *matching* only (display keeps original).
+_TRANSLATE = str.maketrans({
+    "’": "'", "‘": "'",          # curly single quotes / apostrophe
+    "“": '"', "”": '"',          # curly double quotes
+    "–": "-", "—": "-",          # en / em dash
+    "…": "...",                        # ellipsis
+})
+
+
+def norm(s: str) -> str:
+    """Normalize a path component for forgiving comparison."""
+    s = unicodedata.normalize("NFC", s)
+    s = s.translate(_TRANSLATE)
+    s = s.casefold()
+    s = " ".join(s.split())          # collapse/trim whitespace
+    return s.rstrip(". ")            # exFAT strips trailing dots/spaces
+
+
+def is_audio(p: Path) -> bool:
+    return p.suffix.lower() in AUDIO_EXTS
+
+
+def scan(root: Path):
+    """Return {normalized_rel_path: (display_rel_path, audio_count)} for every
+    folder that directly contains audio files."""
+    albums = {}
+    for dirpath, _dirnames, filenames in os.walk(root):
+        count = sum(1 for f in filenames if is_audio(Path(f)))
+        if count == 0:
+            continue
+        rel = Path(dirpath).relative_to(root)
+        key = "/".join(norm(part) for part in rel.parts)
+        albums[key] = (str(rel), count)
+    return albums
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Report music albums that are new or incomplete on the SD card.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    ap.add_argument("-s", "--source", type=Path, default=DEFAULT_SOURCE,
+                    help=f"source library (default: {DEFAULT_SOURCE})")
+    ap.add_argument("-d", "--dest", type=Path, default=DEFAULT_DEST,
+                    help=f"SD card root (default: {DEFAULT_DEST})")
+    ap.add_argument("--show-extra", action="store_true",
+                    help="also list albums on the SD card but not in the source")
+    ap.add_argument("--copy", action="store_true",
+                    help="actually copy the new/incomplete albums to the SD card "
+                         "(default is report-only)")
+    args = ap.parse_args()
+
+    for label, path in (("Source", args.source), ("Dest", args.dest)):
+        if not path.is_dir():
+            sys.exit(f"error: {label} not found: {path}")
+
+    print(f"Source: {args.source}")
+    print(f"Dest:   {args.dest}\n")
+
+    src = scan(args.source)
+    dst = scan(args.dest)
+
+    new_albums = sorted(k for k in src if k not in dst)
+    incomplete = sorted(
+        k for k in src if k in dst and src[k][1] > dst[k][1]
+    )
+
+    if new_albums:
+        print(f"NEW albums to copy ({len(new_albums)}):")
+        for k in new_albums:
+            disp, n = src[k]
+            print(f"  + {disp}  ({n} tracks)")
+    else:
+        print("NEW albums to copy: none")
+
+    print()
+    if incomplete:
+        print(f"INCOMPLETE on SD card — source has more tracks ({len(incomplete)}):")
+        for k in incomplete:
+            disp, n = src[k]
+            print(f"  ~ {disp}  (source {n} vs SD {dst[k][1]})")
+    else:
+        print("INCOMPLETE albums: none")
+
+    if args.show_extra:
+        extra = sorted(k for k in dst if k not in src)
+        print()
+        print(f"On SD card but NOT in source ({len(extra)}) — likely old iPod rips:")
+        for k in extra:
+            disp, n = dst[k]
+            print(f"  - {disp}  ({n} tracks)")
+
+    to_copy = [src[k][0] for k in new_albums] + [src[k][0] for k in incomplete]
+
+    print(f"\nSummary: {len(new_albums)} new, {len(incomplete)} incomplete "
+          f"(source {len(src)} albums, SD {len(dst)} albums).")
+
+    if to_copy and not args.copy:
+        print(f"\nRe-run with --copy to transfer these {len(to_copy)} album(s) to the SD card.")
+    elif to_copy and args.copy:
+        copy_albums(to_copy, args.source, args.dest)
+
+
+def copy_albums(rels, source, dest):
+    """rsync each album folder to the SD card, excluding macOS AppleDouble
+    metadata (._* / .DS_Store) that exFAT cards don't need."""
+    import subprocess
+    print("\n" + "=" * 60)
+    print(f"Copying {len(rels)} album(s) to {dest} ...\n")
+    for rel in rels:
+        s = source / rel
+        d = dest / rel
+        d.mkdir(parents=True, exist_ok=True)
+        cmd = ["rsync", "-rtv", "--size-only",
+               "--exclude=._*", "--exclude=.DS_Store",
+               f"{s}/", f"{d}/"]
+        print(f"-> {rel}")
+        subprocess.run(cmd, check=False)
+    # Strip any AppleDouble files macOS may have written to the card.
+    subprocess.run(["dot_clean", "-m", str(dest)], check=False)
+    print("\nDone. (Ran dot_clean to remove stray ._ files.)")
+
+
+if __name__ == "__main__":
+    main()
