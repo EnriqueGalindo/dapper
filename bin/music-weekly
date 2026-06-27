@@ -1,0 +1,389 @@
+#!/usr/bin/env python3
+"""
+music-weekly — generate a cohesive 20-40 song "playlist of the week" that
+tours your library instead of replaying the same favorites.
+
+How cohesion works (offline base):
+  Every track's (messy) genre tag is mapped to a coarse FAMILY, and the
+  families are laid along a rough sonic SPECTRUM:
+      classical - jazz - latin - folk - country - pop - rock - hardrock - metal - rap
+  A "guided tour" is a gentle walk along that spectrum: adjacent songs stay
+  within ~1 step (so it flows), but across 30 tracks the position drifts, so
+  you cover ground. One track per artist keeps it spread out and exploratory.
+  A weekly seed makes it deterministic per ISO week and different next week;
+  recent weeks are remembered so picks don't repeat.
+
+Optional Last.fm layer (the "hybrid"):
+  If $LASTFM_API_KEY is set and the network is up, the next track is biased
+  toward artists Last.fm considers *similar* to the previous one — real
+  "sounds-like" connections rather than just shared genre. Responses are
+  cached, and it silently falls back to the offline engine if unavailable.
+
+Usage:
+  music-weekly --reindex            # read tags off the card (do this first,
+                                    #   and after adding music)
+  music-weekly                      # print + write this week's playlist
+  music-weekly --length 25          # 20-40 (default 30)
+  music-weekly --style guided|deepdive|surprise
+  music-weekly --seed 42            # force a specific mix (else ISO week)
+  music-weekly --print-only         # don't write the .m3u8, just show it
+
+Output: an .m3u8 at the card root (paths relative to it), plus a printed list.
+Data:   ~/.local/share/dapper/  (track index + weekly history + lastfm cache)
+"""
+
+import argparse
+import json
+import os
+import sys
+import urllib.parse
+import urllib.request
+from collections import defaultdict
+from datetime import date
+from pathlib import Path
+
+# --- make the vendored mutagen importable (repo/vendor next to repo/bin) ---
+_REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_REPO / "vendor"))
+try:
+    from mutagen import File as MFile
+except ImportError:
+    sys.exit("Missing 'mutagen'. Run dapper/install.sh (vendors it locally).")
+
+CARD = Path("/Volumes/MUSIC")
+DATA = Path.home() / ".local/share/dapper"
+INDEX = DATA / "weekly_index.json"
+HISTORY = DATA / "weekly_history.json"
+LFM_CACHE = DATA / "lastfm_cache.json"
+AUDIO_EXTS = {".mp3", ".m4a", ".m4b", ".flac", ".aac", ".ogg", ".opus", ".wav"}
+
+# Genre families laid along a rough sonic spectrum (index = position).
+SPECTRUM = ["classical", "jazz", "latin", "folk", "country",
+            "pop", "rock", "hardrock", "metal", "rap"]
+POS = {f: i for i, f in enumerate(SPECTRUM)}
+
+# Ordered (specific first) keyword -> family rules; first hit wins.
+GENRE_RULES = [
+    ("spoken", None), ("audiobook", None), ("audio book", None),  # exclude
+    ("hip hop", "rap"), ("hip-hop", "rap"), ("rap", "rap"),
+    ("metal", "metal"),
+    ("hard rock", "hardrock"), ("glam", "hardrock"), ("hair", "hardrock"),
+    ("punk", "rock"), ("grunge", "rock"), ("southern rock", "rock"),
+    ("classic rock", "rock"), ("alternative", "rock"), ("rock", "rock"),
+    ("r&b", "pop"), ("rnb", "pop"), ("soul", "pop"), ("pop", "pop"),
+    ("outlaw", "country"), ("americana", "country"), ("bluegrass", "country"),
+    ("country", "country"),
+    ("celtic", "folk"), ("folk", "folk"), ("acoustic", "folk"),
+    ("singer", "folk"), ("songwriter", "folk"), ("traditional", "folk"),
+    ("latin", "latin"), ("salsa", "latin"), ("mariachi", "latin"),
+    ("ranchera", "latin"), ("bolero", "latin"),
+    ("swing", "jazz"), ("big band", "jazz"), ("easy listening", "jazz"),
+    ("jazz", "jazz"), ("blues", "jazz"),
+    ("classical", "classical"), ("opera", "classical"), ("orchestr", "classical"),
+]
+
+
+def classify(genre_raw):
+    if not genre_raw:
+        return None
+    g = genre_raw.lower()
+    for kw, fam in GENRE_RULES:
+        if kw in g:
+            return fam
+    return None
+
+
+def norm(s):
+    return " ".join((s or "").casefold().split())
+
+
+def base_artist(a):
+    """Strip 'feat.'/'x' collaborators so 'P!nk Feat. Eminem' and 'P!nk' count
+    as one artist for spread (but keep real duos like 'George Jones & Merle')."""
+    low = (a or "").lower()
+    for sep in (" feat", " ft.", " ft ", " featuring", " x "):
+        i = low.find(sep)
+        if i != -1:
+            a, low = a[:i], low[:i]
+    return a.strip()
+
+
+def akey(artist):
+    return norm(base_artist(artist))
+
+
+# ---------------- indexing ----------------
+
+def build_index():
+    if not CARD.is_dir():
+        sys.exit(f"error: card not mounted at {CARD}")
+    tracks = []
+    for artist_dir in sorted(p for p in CARD.iterdir()
+                             if p.is_dir() and not p.name.startswith(".")):
+        for dirpath, dirnames, filenames in os.walk(artist_dir):
+            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+            for fn in filenames:
+                if Path(fn).suffix.lower() not in AUDIO_EXTS:
+                    continue
+                p = Path(dirpath) / fn
+                genre = title = year = artist_tag = None
+                dur = 0
+                try:
+                    m = MFile(p, easy=True)
+                    if m:
+                        genre = (m.get("genre") or [None])[0]
+                        title = (m.get("title") or [None])[0]
+                        artist_tag = (m.get("artist") or [None])[0]
+                        d = (m.get("date") or m.get("originaldate") or [None])[0]
+                        if d and str(d)[:4].isdigit():
+                            year = int(str(d)[:4])
+                        if m.info and getattr(m.info, "length", 0):
+                            dur = int(m.info.length)
+                except Exception:
+                    pass
+                fam = classify(genre)
+                # For comps/unknown folders the folder name isn't a real artist
+                artist = artist_dir.name
+                if artist in {"Compilations", "Unknown Artist",
+                              "Various Artists"} and artist_tag:
+                    artist = artist_tag
+                gl = (genre or "").lower()
+                spk = (p.suffix.lower() == ".m4b" or
+                       any(k in gl for k in ("spoken", "audiobook",
+                                             "audio book", "podcast")))
+                tracks.append({
+                    "rel": str(p.relative_to(CARD)),
+                    "artist": artist,
+                    "album": Path(dirpath).name,
+                    "title": title or Path(fn).stem,
+                    "genre": genre, "family": fam, "year": year, "dur": dur,
+                    "spoken": spk,
+                })
+
+    # Audiobooks/podcasts: an album whose median track is very long is spoken
+    # word, even when mis-tagged (e.g. Life of Pi tagged "Pop"). Music albums
+    # stay short even with one long epic, so the median is a robust signal.
+    from statistics import median
+    by_alb = defaultdict(list)
+    for t in tracks:
+        by_alb[(t["artist"], t["album"])].append(t)
+    for ts in by_alb.values():
+        durs = [t["dur"] for t in ts if t["dur"] > 0]
+        if len(ts) >= 4 and durs and median(durs) > 480:   # >8 min median
+            for t in ts:
+                t["spoken"] = True
+    for t in tracks:                                        # lone very-long files
+        if t["dur"] > 1200:
+            t["spoken"] = True
+
+    DATA.mkdir(parents=True, exist_ok=True)
+    INDEX.write_text(json.dumps(tracks))
+    fams = defaultdict(int)
+    spoken = sum(1 for t in tracks if t["spoken"])
+    for t in tracks:
+        fams[t["family"] or "unknown"] += 1
+    print(f"Indexed {len(tracks)} tracks ({spoken} flagged spoken-word, excluded).")
+    print("By family: " + ", ".join(f"{k}={v}" for k, v in
+          sorted(fams.items(), key=lambda x: -x[1])))
+
+
+def load_index():
+    if not INDEX.exists():
+        sys.exit("No index yet. Run:  music-weekly --reindex")
+    return json.loads(INDEX.read_text())
+
+
+# ---------------- Last.fm (optional) ----------------
+
+def lastfm_similar(artist, key, cache):
+    nk = norm(artist)
+    if nk in cache:
+        return cache[nk]
+    url = "https://ws.audioscrobbler.com/2.0/?" + urllib.parse.urlencode({
+        "method": "artist.getsimilar", "artist": artist, "api_key": key,
+        "format": "json", "limit": 50, "autocorrect": 1})
+    try:
+        with urllib.request.urlopen(url, timeout=8) as r:
+            data = json.load(r)
+        sims = {norm(a["name"]) for a in
+                data.get("similarartists", {}).get("artist", [])}
+    except Exception:
+        sims = set()
+    cache[nk] = list(sims)
+    return cache[nk]
+
+
+# ---------------- selection ----------------
+
+STYLES = {           # (window, drift_prob)
+    "guided":   (1, 0.55),
+    "deepdive": (0, 0.10),
+    "surprise": (3, 0.85),
+}
+
+
+def pick_band(by_pos, bands, length, seed):
+    """Choose a contiguous window of `bands` spectrum positions that has enough
+    material, rotating the choice by seed so weeks cover different regions.
+    Returns (lo, hi) inclusive positions."""
+    n = len(SPECTRUM)
+    bands = max(2, min(6, bands))
+    eligible = []
+    for lo in range(0, n - bands + 1):
+        hi = lo + bands - 1
+        arts = {akey(t["artist"]) for p in range(lo, hi + 1) for t in by_pos.get(p, [])}
+        if len(arts) >= length:                     # enough distinct artists to fill
+            eligible.append((lo, hi))
+    if not eligible:                                 # tiny library: use everything
+        present = sorted(by_pos)
+        return (present[0], present[-1]) if present else (0, n - 1)
+    return eligible[seed % len(eligible)]
+
+
+def generate(tracks, length, style, seed, lfm_key, bands, min_secs):
+    import random
+    rng = random.Random(seed)
+    window, drift_p = STYLES[style]
+
+    # usable = real music on the spectrum, not spoken-word, not a short skit
+    usable = [t for t in tracks if t["family"] in POS and not t.get("spoken")
+              and not (0 < t["dur"] < min_secs)]
+
+    by_pos = defaultdict(list)
+    for t in usable:
+        by_pos[POS[t["family"]]].append(t)
+
+    band_lo, band_hi = pick_band(by_pos, bands, length, seed)
+    region = "-".join(SPECTRUM[p] for p in range(band_lo, band_hi + 1)
+                      if by_pos.get(p))
+
+    # recent history -> soft penalty so weeks don't repeat
+    hist = json.loads(HISTORY.read_text()) if HISTORY.exists() else {}
+    recent_artists = set()
+    for wk in list(hist.values())[-6:]:
+        recent_artists.update(akey(a) for a in wk)
+
+    lfm_cache = json.loads(LFM_CACHE.read_text()) if LFM_CACHE.exists() else {}
+
+    # start at the densest family inside the band
+    in_band = [p for p in range(band_lo, band_hi + 1) if by_pos.get(p)]
+    pos = max(in_band, key=lambda p: len(by_pos[p]))
+
+    chosen, used_art, used_alb = [], set(), set()
+    prev_artist = None
+    steps = 0
+    while len(chosen) < length and steps < length * 40:
+        steps += 1
+        lo = max(band_lo, pos - window)
+        hi = min(band_hi, pos + window)
+        cands = [t for p in range(lo, hi + 1) for t in by_pos.get(p, [])
+                 if akey(t["artist"]) not in used_art
+                 and (t["artist"], t["album"]) not in used_alb]
+        if not cands:                       # widen within the band, then bail
+            cands = [t for p in range(band_lo, band_hi + 1) for t in by_pos.get(p, [])
+                     if akey(t["artist"]) not in used_art
+                     and (t["artist"], t["album"]) not in used_alb]
+            if not cands:
+                break
+
+        sims = set()
+        if lfm_key and prev_artist:
+            sims = set(lastfm_similar(prev_artist, lfm_key, lfm_cache))
+
+        def score(t):
+            s = 0.0
+            s -= abs(POS[t["family"]] - pos) * 1.5          # closeness = cohesion
+            if akey(t["artist"]) in sims:    s += 4.0       # Last.fm similar
+            if akey(t["artist"]) in recent_artists: s -= 2.0  # freshness
+            s += rng.random() * 1.2                          # variety
+            return s
+
+        nxt = max(cands, key=score)
+        chosen.append(nxt)
+        used_art.add(akey(nxt["artist"]))
+        used_alb.add((nxt["artist"], nxt["album"]))
+        prev_artist = base_artist(nxt["artist"])
+
+        if rng.random() < drift_p:           # wander, but only within the band
+            step = rng.choice([-1, 1])
+            pos = max(band_lo, min(band_hi, pos + step))
+
+    DATA.mkdir(parents=True, exist_ok=True)
+    LFM_CACHE.write_text(json.dumps(lfm_cache))
+    return chosen, region
+
+
+# ---------------- output ----------------
+
+def fmt_dur(s):
+    return f"{s // 60}:{s % 60:02d}" if s else "?:??"
+
+
+def write_m3u(chosen, out_path):
+    lines = ["#EXTM3U"]
+    for t in chosen:
+        lines.append(f'#EXTINF:{t["dur"]},{t["artist"]} - {t["title"]}')
+        lines.append(t["rel"])
+    out_path.write_text("\n".join(lines) + "\n")
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Generate a weekly cohesive exploration playlist.",
+        formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
+    ap.add_argument("--reindex", action="store_true",
+                    help="read genre/year tags off the card and cache them")
+    ap.add_argument("--length", type=int, default=30, help="songs (20-40)")
+    ap.add_argument("--bands", type=int, default=4,
+                    help="how many adjacent genre families a week spans (3-5; "
+                         "fewer = more cohesive)")
+    ap.add_argument("--style", choices=list(STYLES), default="guided")
+    ap.add_argument("--min-secs", type=int, default=60,
+                    help="skip tracks shorter than this (intros/skits; default 60)")
+    ap.add_argument("--seed", type=int, help="override the weekly seed")
+    ap.add_argument("--print-only", action="store_true",
+                    help="don't write the .m3u8, just print the list")
+    ap.add_argument("--out", type=Path, help="playlist output path")
+    args = ap.parse_args()
+
+    if args.reindex:
+        return build_index()
+
+    length = max(20, min(40, args.length))
+    tracks = load_index()
+
+    iso = date.today().isocalendar()
+    week_id = f"{iso[0]}-W{iso[1]:02d}"
+    seed = args.seed if args.seed is not None else iso[0] * 100 + iso[1]
+    lfm_key = os.environ.get("LASTFM_API_KEY")
+
+    chosen, region = generate(tracks, length, args.style, seed, lfm_key,
+                              args.bands, args.min_secs)
+    if not chosen:
+        sys.exit("Could not assemble a playlist (try --reindex).")
+
+    title = f"Weekly {week_id}" + (f" ({args.style})" if args.style != "guided" else "")
+    print(f"\n{title} — {len(chosen)} songs   region: {region}"
+          f"{'  [Last.fm on]' if lfm_key else ''}\n")
+    last_fam = None
+    for i, t in enumerate(chosen, 1):
+        marker = f"  ~{t['family']}~" if t["family"] != last_fam else ""
+        last_fam = t["family"]
+        yr = f" ({t['year']})" if t.get("year") else ""
+        print(f"  {i:>2}. {t['artist']} — {t['title']}{yr}  [{fmt_dur(t['dur'])}]{marker}")
+
+    if not args.print_only:
+        out = args.out or (CARD / f"{title}.m3u8")
+        if CARD.is_dir():
+            write_m3u(chosen, out)
+            hist = json.loads(HISTORY.read_text()) if HISTORY.exists() else {}
+            hist[week_id] = [t["artist"] for t in chosen]
+            HISTORY.write_text(json.dumps(hist))
+            print(f"\nWrote {out}")
+        else:
+            print("\n(card not mounted — not writing .m3u8; use --print-only "
+                  "to silence this)")
+
+
+if __name__ == "__main__":
+    main()
