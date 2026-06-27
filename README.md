@@ -14,7 +14,6 @@ run on a Mac (Python 3, standard library only) against the mounted card.
 |---|---|
 | `music-sync-check` | Reports which albums are **new or incomplete** on the card vs. your library, and optionally copies them over. |
 | `music-disc-merge` | Merges **multi-disc albums** split across sibling folders (`Time Disc 1/2/3`) into one folder. |
-| `music-listens` | **Experimental.** Detects what was played on the device by reading the card's per-file access timestamps. |
 
 ### `music-sync-check`
 
@@ -52,22 +51,27 @@ music-disc-merge /Volumes/MUSIC --apply      # do it
 - Skips single-disc "orphan" groups (incomplete rips, or discs whose folder
   names don't match) unless you pass `--include-orphans`.
 
-### `music-listens` (experimental)
+## Listen tracking — why there isn't any
 
-The player can't run a script and doesn't log plays. The one possible signal:
-exFAT stores a **last-accessed time** per file, and macOS mounts the card
-`noatime` so reads on the Mac don't disturb it. *If* the player's firmware
-updates access-time on playback, a file whose atime advanced since the last
-snapshot was played on the device. Whether the Echo Mini actually does this is
-unproven — `snapshot` + `check` are the experiment.
+Short version: **the Echo Mini leaves no trace of what you played**, so
+automatic listen tracking isn't possible on this device. This was tested, not
+assumed:
 
-```sh
-music-listens snapshot           # record current access-times
-#   ...play tracks on the DAP, reinsert the card...
-music-listens check              # files whose atime advanced (= played?)
-music-listens check --commit     # add to cumulative counts, re-snapshot
-music-listens top                # cumulative most-played
-```
+- **No scrobble/play-count feature.** The player has no WiFi, no apps, and no
+  Rockbox-style `.scrobbler.log` output.
+- **It doesn't update file access-times on playback.** exFAT stores a
+  last-accessed timestamp and macOS mounts the card `noatime` (so Mac reads
+  don't disturb it), which would have let a Mac-side script infer plays from
+  advancing atimes. Tested by snapshotting atimes, playing tracks on the
+  device, and re-checking: the played files' access-times were **unchanged**.
+- **It writes nothing else to the card.** After a playback session, no
+  resume-position file, database, or settings file appears or changes — the
+  only thing touched is macOS's own `.fseventsd`.
+
+To the player the card is read-only storage. The only ways to track listens
+would be manual logging or a future firmware feature. (On DAPs whose firmware
+*does* bump access-times, a snapshot/diff approach would work — it just doesn't
+here.)
 
 ## Install
 
