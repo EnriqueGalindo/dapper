@@ -74,12 +74,13 @@ even when mis-tagged) and short intros/skits are excluded.
 ```sh
 music-weekly --reindex          # read tags off the card (first run, and after
                                 #   adding music)
-music-weekly                    # print + write this week's .m3u8 to the card
+music-weekly                    # copy this week's set into a folder on the card
 music-weekly --length 25        # 20-40 songs (default 30)
 music-weekly --bands 3          # fewer adjacent genres = more cohesive (3-5)
 music-weekly --style guided|deepdive|surprise
 music-weekly --seed 42          # force a different mix
-music-weekly --print-only       # show it without writing the file
+music-weekly --m3u              # write an .m3u8 instead (for other players)
+music-weekly --print-only       # show it without writing anything
 ```
 
 **Hybrid similarity (optional):** set a free Last.fm API key and the next track
@@ -91,9 +92,13 @@ genre engine is used.
 export LASTFM_API_KEY=xxxxxxxx   # then run music-weekly as usual
 ```
 
-The playlist is written as an `.m3u8` at the card root with paths relative to
-it. (If your player doesn't read `.m3u8`, the printed list still works as a
-guide.)
+**Output:** the Echo Mini can't read `.m3u` playlists (confirmed against FiiO's
+docs — it only has an on-device Favorites list), so by default `music-weekly`
+**copies the tracks into `_Playlist of the Week/` on the card**, numbered so
+they play in order when you browse to that folder. The folder is cleared and
+refreshed each run, and is skipped during indexing so it never feeds back into
+future playlists. Use `--m3u` to write a standard `.m3u8` instead for players
+that support it.
 
 ## Listen tracking — why there isn't any
 
